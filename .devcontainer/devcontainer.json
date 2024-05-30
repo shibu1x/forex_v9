@@ -1,0 +1,13 @@
+{
+    "dockerComposeFile": "../compose.yaml",
+    "service": "app_dev",
+    "workspaceFolder": "/app",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "bmewburn.vscode-intelephense-client",
+                "neilbrayfield.php-docblocker"
+            ]
+        }
+    }
+}

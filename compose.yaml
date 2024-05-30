@@ -1,0 +1,10 @@
+services:
+  app_dev:
+    # docker compose run --rm --entrypoint '' app_dev /bin/bash
+    build:
+      dockerfile: Dockerfile.dev
+      args:
+        proxy: 1
+    tty: true
+    volumes:
+      - .:/app:delegated
