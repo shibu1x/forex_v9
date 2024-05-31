@@ -1,11 +1,11 @@
 FROM php:8.3-cli
 
+# For local build testing
 ARG proxy
 RUN if [[ -z "$proxy" ]] ; then echo 'Acquire::http { Proxy "http://home1.quud.net:3142"; };' >> /etc/apt/apt.conf.d/01proxy ; fi
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-    unzip \
+RUN apt update \
+    && apt install -y unzip \
     && docker-php-ext-install pdo pdo_mysql \
     && rm -rf /var/lib/apt/lists/*
 
