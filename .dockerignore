@@ -18,4 +18,4 @@ public/hot
 .env
 build_local.sh
 Dockerfile
-docker-compose.yml
+compose.yml

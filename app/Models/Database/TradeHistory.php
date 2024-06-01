@@ -12,34 +12,11 @@ class TradeHistory extends Model
 {
     use HasFactory;
 
-    protected $fillable = ['open_at', 'trade_rule_id', 'action', 'open_price', 'overflow', 'open_band_range'];
+    protected $fillable = ['open_at', 'trade_rule_id', 'action', 'open_price', 'overflow', 'open_band_range_rate'];
 
-    public static function simulate(string $symbol = null): void
-    {
-        self::truncate();
-
-        Backtest::get()->setActive(true);
-
-        $builder = TradeRule::on();
-        if ($symbol) {
-            $builder->where('symbol', $symbol);
-        }
-
-        $builder->each(function (TradeRule $trade_rule) {
-            for ($days = 360; $days >= 0; $days--) {
-                $day = Carbon::today()->subDays($days);
-                if ($day->isSaturday() || $day->isSunday()) {
-                    continue;
-                }
-
-                Backtest::get()->setDay($day);
-
-                $trade_rule->trade();
-            }
-
-            $trade_rule->updateBacktestScore();
-        });
-    }
+    protected $casts = [
+        'open_at' => 'datetime',
+    ];
 
     /**
      * open
@@ -52,13 +29,13 @@ class TradeHistory extends Model
         $log_data = $trade_rule->getBreakoutLog();
 
         self::firstOrCreate([
-            'open_at' => Backtest::get()->isActive() ? Backtest::get()->getDay() : Carbon::today(),
+            'open_at' => $trade_rule->getLatestDay(),
             'trade_rule_id' => $trade_rule->id,
             'action' => $trade_rule->action,
         ], [
-            'open_price' => $log_data['close_price'],
+            'open_price' => $trade_rule->open_price,
             'overflow' => $log_data['overflow'],
-            'open_band_range' => $log_data['band_range'],
+            'open_band_range_rate' => $log_data['band_range_rate'],
         ]);
     }
 
@@ -75,31 +52,43 @@ class TradeHistory extends Model
             ->orderBy('id', 'desc')
             ->first();
 
-        if ($trade) {
-            $log_data = $trade_rule->getBreakoutLog();
-
-            $trade->updateClosePrice($log_data['close_price']);
-        }
-    }
-
-    public function updateClosePrice(float $close_price): void
-    {
-        if ($this->close_price !== 0.0) {
+        if (!$trade || $trade->isClosed()) {
             return;
         }
 
-        $this->close_price = $close_price;
-        $this->close_at = Backtest::get()->isActive() ? Backtest::get()->getDay() : Carbon::today();
+        $trade->updateClosePrice($trade_rule);
+    }
 
-        if ($this->action === 'long') {
-            $diff_price = $this->close_price - $this->open_price;
-        } else {
-            $diff_price = $this->open_price - $this->close_price;
-        }
+    private function isClosed(): bool
+    {
+        return $this->close_price !== 0.0;
+    }
 
-        $this->pl = $this->tradeRule->toPips($diff_price);
+    private function updateClosePrice(TradeRule $trade_rule): void
+    {
+        $this->close_price = $trade_rule->getLatestClosePrice();
+        $this->close_at = $trade_rule->getLatestDay();
+        $this->profit_rate = $this->tradeRule->getProfitRate();
+
+        $profit_rate_range = DailyLog::getProfitRateRange($this->tradeRule);
+        $this->min_profit_rate = $profit_rate_range[0];
+        $this->max_profit_rate = $profit_rate_range[1];
+        $this->days = $this->close_at->diffInDays($this->open_at);
 
         $this->save();
+    }
+
+    /**
+     * ポジションを開いてからの経過日数
+     *
+     * @return integer
+     */
+    public function getOpenedPositionDays(): int
+    {
+        if ($this->isClosed()) {
+            return -1;
+        }
+        return Carbon::today()->diffInDays($this->open_at);
     }
 
     public function tradeRule(): BelongsTo

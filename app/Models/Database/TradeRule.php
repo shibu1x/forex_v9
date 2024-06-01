@@ -2,12 +2,13 @@
 
 namespace App\Models\Database;
 
-use App\Models\Concept\AlphaVantageApi;
 use App\Models\Concept\Backtest;
 use App\Models\Concept\Util;
+use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 
@@ -19,10 +20,11 @@ class TradeRule extends Model
 
     protected $casts = [
         'input' => 'array',
-        'candles' => 'array',
-        'action_at' => 'datetime',
+        'note' => 'array',
         'priced_at' => 'datetime',
-        'candles_at' => 'datetime',
+        'is_update_action' => 'boolean',
+        'is_open_pos' => 'boolean',
+        'is_close_pos' => 'boolean',
     ];
 
     private bool $is_long;
@@ -53,57 +55,61 @@ class TradeRule extends Model
 
     public function trade(): void
     {
-        // 反対方向のポジションがあった場合はclose
-        $this->closeTrade();
+        try {
+            $this->is_close_pos = $this->isClosePosition();
 
-        // 新規注文
-        $this->createOrder();
+            $this->is_update_action = $this->isUpdateAction();
+
+            $this->is_open_pos = $this->isOpenPosition();
+
+            if ($this->is_close_pos && !Backtest::get()->isActive()) {
+                $this->updateBacktestScore();
+            }
+        } finally {
+            $this->save();
+        }
+
+        // 日々の変化を記録
+        DailyLog::addLog($this);
     }
 
-    public function closeTrade(): void
+    public function isClosePosition(bool $is_force = false): bool
     {
-        // 片方が breackoutしていたらclose
-        if (!$this->isChannelBreakOut($this->input['close_length']) && !$this->isChannelBreakOut()) {
-            return;
+        if (!$this->isChannelBreakOut($this->input['close_length']) && !$is_force) {
+            return false;
         }
 
         TradeHistory::closePosition($this);
 
-        Log::info('Close trade.', [$this->symbol, $this->action]);
-    }
-
-    public function createOrder(): void
-    {
-        try {
-            // 方向を更新
-            $this->updateAction();
-        } finally {
-            $this->save();
-        }
+        return true;
     }
 
     /**
-     * 方向を更新
+     * 方向の更新
      *
-     * @return void
+     * @return boolean
      */
-    public function updateAction(): void
+    public function isUpdateAction(): bool
     {
         if (!$this->isChannelBreakOut()) {
-            return;
+            return false;
         }
+
+        TradeHistory::closePosition($this);
 
         // 方向を反転
         $this->action = $this->is_long ? 'short' : 'long';
+        $this->open_price = $this->getLatestClosePrice();
         $this->init();
 
-        $log_data = $this->getBreakoutLog();
-        $this->action_at = Util::convertCarbon($log_data['close_time']);
-        $this->open_price = $this->round($log_data['close_price'], -1);
-
-        Log::info('Update action.', [$this->symbol, $this->is_long ? 'short -> long' : 'long -> short', $this->open_price]);
-
         TradeHistory::openPosition($this);
+
+        return true;
+    }
+
+    public function isOpenPosition(): bool
+    {
+        return $this->input['profit_rate_trigger'] > $this->getProfitRate();
     }
 
     public function getBreakoutLog(): array
@@ -116,10 +122,16 @@ class TradeRule extends Model
      *
      * @return float
      */
-    private function getLatestClosePrice(): float
+    public function getLatestClosePrice(): float
     {
-        $latest_candle = $this->getCandles()->first();
+        $latest_candle = $this->candle->getCandles()->first();
         return $this->round($latest_candle['mid']['c'], -1);
+    }
+
+    public function getLatestDay(): Carbon
+    {
+        $latest_candle = $this->candle->getCandles()->first();
+        return Util::convertCarbon($latest_candle['time']);
     }
 
     /**
@@ -127,11 +139,15 @@ class TradeRule extends Model
      *
      * @return integer
      */
-    private function getPlPercent(): float
+    public function getProfitRate(): float
     {
         $close_price = $this->getLatestClosePrice();
 
         $diff_price = ($close_price - $this->open_price) * $this->action_int;
+
+        if ($this->open_price === 0.0) {
+            return 0.0;
+        }
 
         return round($diff_price / $this->open_price * 100, 2);
     }
@@ -141,9 +157,9 @@ class TradeRule extends Model
      *
      * @return float
      */
-    private function getChangePercent(): float
+    private function getChangeRate(): float
     {
-        $candles = $this->getCandles();
+        $candles = $this->candle->getCandles();
 
         $candle1 =  $candles->shift();
         $candle2 =  $candles->shift();
@@ -151,17 +167,6 @@ class TradeRule extends Model
         $diff_price = ($candle1['mid']['c'] - $candle2['mid']['c']);
 
         return round($diff_price / $candle2['mid']['c'] * 100, 2);
-    }
-
-    /**
-     * 方向が今日変わったか
-     *
-     * @return boolean
-     */
-    public function isActionUpdated(): bool
-    {
-        $latest_candle = $this->getCandles()->first();
-        return intval($this->action_at->format('Ymd')) === $latest_candle['time'];
     }
 
     /**
@@ -173,28 +178,23 @@ class TradeRule extends Model
         // チャネル取得
         $channel_bands = $this->getChannelBands($length);
 
-        // チャネル幅 (pips)
-        $band_range = $this->toPips($channel_bands[1] - $channel_bands[0]);
+        // チャンネル幅の%
+        $band_range_rate = intval((1 - $channel_bands[0] / $channel_bands[1]) * 1000);
 
         // チャネル幅が規定値以下か
-        if ($band_range < $this->input['band_range']['min']) {
+        if ($band_range_rate < $this->input['band_range_rate']['min']) {
             // 変わっていないことにする
             return false;
         }
 
-        $latest_candle = $this->getCandles()->first();
-        $close_price = floatval($latest_candle['mid']['c']);
-
         $threshold = $this->is_long ? $channel_bands[0] : $channel_bands[1];
 
-        $overflow = $this->toPips($close_price - $threshold);
+        $overflow = $this->toPips($this->getLatestClosePrice() - $threshold);
 
         // ログ用のデータを残す
         $breakout_log = [
-            'close_price' => $close_price,
-            'close_time' => $latest_candle['time'],
             'overflow' => abs($overflow),
-            'band_range' => $this->toPips($channel_bands[1] - $channel_bands[0]),
+            'band_range_rate' => $band_range_rate,
         ];
 
         if ($this->is_long && $overflow < $this->input['overflow'] * -1) {
@@ -220,10 +220,8 @@ class TradeRule extends Model
      */
     private function getChannelBands(int $length = 0): array
     {
-        $this->updateCandles();
-
         // ローソク足を取得
-        $candles = $this->getCandles();
+        $candles = $this->candle->getCandles();
 
         if ($length === 0) {
             $length = $this->input['length'];
@@ -242,55 +240,6 @@ class TradeRule extends Model
                 return $item['mid']['h'];
             }), -1)
         ];
-    }
-
-    private function updateCandles(): bool
-    {
-        if ($this->candles_at->diffInDays() <= 1) {
-            // 1日経過していない
-            return false;
-        }
-
-        if (
-            $this->candles_at->isFriday()
-            && isset($this->candles)
-            && $this->candles_at->diffInDays() <= 3
-        ) {
-            // 土日は更新しない
-            return false;
-        }
-
-        Log::info('Update candles', [$this->symbol]);
-
-        $this->candles = AlphaVantageApi::get()->getCandles($this->symbol, [
-            'function' => 'FX_DAILY',
-            'count' => Backtest::get()->isActive() ? 500 : $this->input['length'] + 2,
-        ]);
-
-        $this->candles_at = Util::convertCarbon($this->candles[0]['time']);
-
-        $this->save();
-
-        return true;
-    }
-
-    /**
-     * 完了しているローソク足を取得
-     *
-     * @return Collection
-     */
-    private function getCandles(): Collection
-    {
-        $candles = collect($this->candles);
-
-        // backtestの場合
-        if (Backtest::get()->isActive()) {
-            $candles = $candles->filter(function (array $item) {
-                return Backtest::get()->filterCandles($item);
-            });
-        }
-
-        return $candles;
     }
 
     /**
@@ -314,17 +263,88 @@ class TradeRule extends Model
         return round($price, $this->precision + $point);
     }
 
+    public function candle(): HasOne
+    {
+        return $this->hasOne(Candle::class, 'symbol', 'symbol');
+    }
+
     public function tradeHistory(): HasMany
     {
         return $this->hasMany(TradeHistory::class);
     }
 
-    public function updateBacktestScore(): void
+    public static function optimize(string $symbol): void
     {
-        $this->backtest_long = $this->tradeHistory->where('action', 'long')->sum('pl') / $this->input['ratio'];
-        $this->backtest_short = $this->tradeHistory->where('action', 'short')->sum('pl') / $this->input['ratio'];
+        Log::info('Backtest running.', [$symbol]);
 
+        // deleteを実行 id最小のものをselect。それ以外を削除
+        $origin = self::where('symbol', $symbol)->first();
+        self::where('symbol', $symbol)
+            ->where('id', '!=', $origin->id)
+            ->delete();
+
+        foreach ([180, 270, 360] as $term) {
+            for ($len = 3; $len <= 13; $len += 2) {
+                // close_length <= length 
+                for ($range = 7; $range <= 23; $range += 2) {
+                    $origin->createInputCase($term, [
+                        'length' => $len,
+                        'close_length' => $len,
+                        'band_range_rate' => [
+                            'min' => $range,
+                        ],
+                    ]);
+                }
+            }
+        }
+
+        self::runBacktests($symbol);
+    }
+
+    public static function runBacktests(string $symbol = null): void
+    {
+        $builder = self::on();
+        if ($symbol) {
+            $builder->where('symbol', $symbol);
+        }
+
+        $builder->chunkById(5, function (Collection $selfs) {
+            foreach ($selfs as $self) {
+                $self->runBacktest();
+            }
+        });
+    }
+
+    private function runBacktest(): void
+    {
+        Log::info('Backtesting.', [$this->symbol, $this->id]);
+
+        $this->tradeHistory()->delete();
+
+        $backtest = Backtest::get();
+
+        // 700日前まで。計算用の期間 -30 で 670日
+        // 短期間で利益を上げたい場合は期間を短めに設定する
+        $backtest->setStartDaysAgo($this->term);
+        while ($backtest->nextDay()) {
+            $this->trade();
+        }
+
+        if ($backtest->isForceClose()) {
+            // 最後の現ポジションのclose処理を入れる
+            $this->isClosePosition(true);
+        }
+
+        $this->updateBacktestScore();
         $this->save();
+    }
+
+    private function updateBacktestScore(): void
+    {
+        $this->load('tradeHistory');
+        $this->backtest_long = $this->tradeHistory->where('action', 'long')->sum('profit_rate');
+        $this->backtest_short = $this->tradeHistory->where('action', 'short')->sum('profit_rate');
+        $this->backtest_cnt = $this->tradeHistory->count();
     }
 
     /**
@@ -333,70 +353,157 @@ class TradeRule extends Model
      * @param array $input
      * @return void
      */
-    public function createInputCase(array $input): void
+    private function createInputCase($term, array $input): void
     {
-        Backtest::get()->setActive(true);
-
-        // ローソク足を更新する
-        $this->updateCandles();
-
         $copy = $this->replicate();
+        $copy->term = $term;
         $copy->input = array_merge($this->input, $input);
         $copy->save();
+    }
+
+    /**
+     * 最適なデータを探し出し、それ以外を削除する
+     *
+     * @return void
+     */
+    public static function clean(): void
+    {
+        self::select('symbol', 'term')
+            ->groupBy('symbol', 'term')
+            ->get()
+            ->each(function (self $self) {
+                Log::info('Cleaning...', [$self->symbol, $self->term]);
+                $self->chooseOne();
+            });
+    }
+
+    private function chooseOne(): void
+    {
+        $first = self::where('symbol', $this->symbol)
+            ->where('term', $this->term)
+            ->select('*')
+            ->selectRaw('backtest_long + backtest_short AS score')
+            ->orderBy('score', 'desc')
+            ->orderByRaw('input->"$.length"')
+            ->orderByRaw('input->"$.band_range_rate.min"')
+            ->orderByRaw('input->"$.close_length" desc')
+            ->first();
+
+        if ($first) {
+            self::where('symbol', $this->symbol)
+                ->where('term', $this->term)
+                ->where('id', '!=', $first->id)
+                ->delete();
+        }
+    }
+
+    /**
+     * ポジション日数
+     *
+     * @return integer
+     */
+    private function getOpenedPositionDays(): int
+    {
+        $latest = $this->tradeHistory->last();
+        if (!$latest) {
+            return -1;
+        }
+        return $latest->getOpenedPositionDays();
     }
 
     public static function getTextStatus(): string
     {
         // テキスト作成
         return view('discord.traderule_status', [
-            'items' => self::lazy()->map(function (self $self) {
+            'items' => self::orderBy('symbol')->orderBy('term')->lazy()->map(function (self $self) {
                 return (object)[
                     'symbol' => $self->symbol,
+                    'term' => $self->term,
+                    'is_head' => $self->term === 180,
                     'action' => $self->action,
-                    'is_action_updated' => $self->isActionUpdated(),
                     'close_price' => $self->getLatestClosePrice(),
-                    'open_price' => $self->open_price,
-                    'pl_pr' => $self->getPlPercent(),
-                    'chg_pr' => $self->getChangePercent(),
+                    'profit_rate' => $self->getProfitRate(),
+                    'change_rate' => $self->getChangeRate(),
+                    'is_update_action' => $self->is_update_action,
+                    'is_open_pos' => $self->is_open_pos,
+                    'is_close_pos' => $self->is_close_pos,
+                    'opened_pos_days' => $self->getOpenedPositionDays(),
+                    'backtest_long' => round($self->backtest_long, 1),
+                    'backtest_short' => round($self->backtest_short, 1),
                 ];
             }),
         ])->render();
+    }
+
+    public static function exportInitData(): void
+    {
+        self::orderBy('symbol')->lazy()->each(function (self $self) {
+            $output = [
+                "'{$self->symbol}'", $self->term, "'{$self->action}'", $self->input['length'],
+                $self->input['close_length'], $self->input['band_range_rate']['min'], $self->input['overflow'],
+                $self->input['profit_rate_trigger'], $self->note['margin'], "'{$self->note['memo']}'"
+            ];
+            echo "[" . implode(",", $output) . "], // {$self->backtest_long}, {$self->backtest_short} \n";
+        });
     }
 
     public static function importInitData(): void
     {
         self::upsert(
             collect([
-                ['USD_JPY',  'long', 'D',  9,  9, 15, 0, 60733, 'longのみ。スワップが厳しい'], // 9861
-                ['EUR_USD', 'short', 'D',  7,  7,  3, 0, 65793, ''], // 6213
-                ['USD_CHF',  'long', 'D',  5,  5,  6, 0, 60733, ''], // 6078
-                ['GBP_USD', 'short', 'D',  8,  6, 21, 0, 76730, ''], // 5187
-                // ['USD_CAD',  'long', 'D',  6,  6,  0, 0, 60733, ''], // 3483
-                // ['NZD_USD', 'short', 'D',  4,  4, 12, 0, 36584, '触らない'], // 2136
-                // ['AUD_USD',  'long', 'D',  8,  8,  0, 0, 40022, '触らない'], // -3172
+                ['EUR_USD', 180, 'long',  7,  7,  9, 0, -0.21, 65793, ''], // 1.26, 2.54 
+                ['EUR_USD', 270, 'long',  7,  7,  9, 0, -0.21, 65793, ''], // 3.7, 1.71 
+                ['EUR_USD', 360, 'long',  7,  7,  9, 0, -0.21, 65793, ''], // 3.7, 5.97 
+                ['GBP_USD', 180, 'long',  9,  9, 13, 0, -0.37, 76730, 'USD shortならこれ'], // 1.66, 1.15 
+                ['GBP_USD', 270, 'long',  9,  9, 13, 0, -0.37, 76730, 'USD shortならこれ'], // 4.71, 2.17 
+                ['GBP_USD', 360, 'long',  9,  9, 13, 0, -0.37, 76730, 'USD shortならこれ'], // 4.71, 5.16 
+                ['NZD_USD', 180, 'long',  9,  9, 18, 0, -0.54, 36584, ''], // 2.07, 4.34 
+                ['NZD_USD', 270, 'long', 11, 11, 19, 0, -0.54, 36584, ''], // 4.42, 0.23 
+                ['NZD_USD', 360, 'long',  3,  3, 13, 0, -0.54, 36584, ''], // 4.56, 3.77 
+                ['USD_CHF', 180, 'short', 3,  3, 11, 0, -0.39, 60733, 'long only'], // 5.53, 0.12 
+                ['USD_CHF', 270, 'short', 3,  3, 11, 0, -0.39, 60733, 'long only'], // 4.27, 6.65 
+                ['USD_CHF', 360, 'short', 3,  3, 11, 0, -0.39, 60733, 'long only'], // 10.15, 6.65 
+                ['USD_JPY', 180, 'long',  7,  7, 21, 0,  0.01, 60733, 'long only'], // 7.02, -3.23 
+                ['USD_JPY', 270, 'short', 5,  5, 11, 0,  0.01, 60733, 'long only'], // 5.75, 0.82 
+                ['USD_JPY', 360, 'long',  3,  3, 13, 0,  0.01, 60733, 'long only'], // 11.02, 0.36 
+                // ['USD_CAD', 180, 'long', 11, 11, 13, 0, -0.19, 60733, ''], // 2, 0 
+                // ['USD_CAD', 270, 'short', 5,  5, 11, 0, -0.19, 60733, ''], // 2.22, 1.49 
+                // ['USD_CAD', 360, 'long', 13, 13, 17, 0, -0.19, 60733, ''], // 3.21, 0.58
+                // ['AUD_USD', 180, 'long',  5,  5, 19, 0, -0.72, 40022, '触らない'], // 1.32, 0.85 
+                // ['AUD_USD', 270, 'long',  3,  3, 23, 0, -0.72, 40022, '触らない'], // 0, 0 
+                // ['AUD_USD', 360, 'short', 9,  9,  7, 0, -0.72, 40022, '触らない'], // 0.49, 1.65 
             ])->map(function (array $item, $idx) {
                 $i = 0;
                 return [
                     'id' => $idx + 1,
                     'symbol' => $item[$i],
                     'precision' => strpos($item[$i++], 'JPY') === false ? 5 : 3,
+                    'term' => $item[$i++],
                     'action' => $item[$i++],
                     'input' => json_encode([
-                        'granularity' => $item[$i++],
                         'length' => $item[$i++],
                         'close_length' => $item[$i++],
-                        'band_range' => [
-                            'min' => $item[$i++] * 100,
+                        'band_range_rate' => [
+                            'min' => $item[$i++],
                         ],
                         'overflow' => $item[$i++],
+                        // ポジションを開く/閉じるチャンス
+                        'profit_rate_trigger' => $item[$i++],
                         // 必要証拠金の倍率
-                        'ratio' => round($item[$i++] / 36584, 2),
+                        'ratio' => round($item[$i] / 36584, 2),
                     ]),
+                    'note' => json_encode([
+                        'margin' => $item[$i++],
+                        'memo' => $item[$i++],
+                    ]),
+
                 ];
             })->toArray(),
             ['id'], // レコード識別子
             ['input'] // updateの場合に更新するcolumn
         );
+
+        Candle::initData();
 
         Log::info('Imported trade rules.');
     }

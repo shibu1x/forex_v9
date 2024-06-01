@@ -2,7 +2,7 @@
 
 namespace App\Console\Commands;
 
-use App\Models\Database\TradeHistory;
+use App\Models\Concept\Backtest;
 use App\Models\Database\TradeRule;
 use Carbon\Carbon;
 use Illuminate\Console\Command;
@@ -16,8 +16,13 @@ class OptimizeCommand extends Command
 
     public function handle()
     {
+        Backtest::get()->setContext([
+            'is_active' => true,
+            'is_force_close' => true,
+        ]);
+
         // default
-        $symbols = TradeRule::all()->pluck('symbol');
+        $symbols = TradeRule::all()->pluck('symbol')->unique();
 
         if ($symbol = $this->argument('symbol')) {
             $symbols = collect([$symbol]);
@@ -25,28 +30,12 @@ class OptimizeCommand extends Command
 
         $start = Carbon::now();
 
-        Log::info('creating a backtest cases...');
+        Log::info('Creating a backtest cases...');
 
         $symbols->each(function (string $symbol) {
-            $rule = TradeRule::where('symbol', $symbol)->first();
-            for ($len = 5; $len <= 16; $len += 2) {
-                // close_length <= length 
-                for ($c_len = $len; $c_len >= 5; $c_len -= 2) {
-                    for ($range = 0; $range <= 24; $range += 3) {
-                        $rule->createInputCase([
-                            'length' => $len,
-                            'close_length' => $c_len,
-                            'band_range' => [
-                                'min' => $range * 100,
-                            ],
-                        ]);
-                    }
-                }
-            }
-
-            TradeHistory::simulate($symbol);
+            TradeRule::optimize($symbol);
         });
 
-        Log::info($start->diffInMinutes() . ' s');
+        Log::info($start->diffInMinutes() . ' m');
     }
 }
